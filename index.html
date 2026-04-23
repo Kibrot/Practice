@@ -9,8 +9,21 @@
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/mobile-drag-drop@2.3.0-rc.2/default.css">
+  <script src="https://cdn.jsdelivr.net/npm/mobile-drag-drop@2.3.0-rc.2/index.min.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", function() {
+      MobileDragDrop.polyfill({ holdToDrag: 250 });
+      window.addEventListener('touchmove', function() {}, {passive: false});
+    });
+  </script>
+
   <style>
-    body, html { margin: 0; padding: 0; height: 100%; background: #1a1612; }
+    body, html { 
+      margin: 0; padding: 0; height: 100%; background: #1a1612; 
+      -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+    }
+    input, pre { -webkit-user-select: auto; user-select: auto; }
   </style>
 </head>
 <body>
@@ -31,7 +44,6 @@
       return a;
     };
 
-    // Auto-save helpers
     function load(key, fb) {
       try { 
         const r = localStorage.getItem(STORAGE_PREFIX + key); 
@@ -104,12 +116,19 @@
       const [lateInput, setLateInput] = useState("");
       const [showSummary, setShowSummary] = useState(false);
 
+      // Pair State
+      const [pairedWith, setPairedWith] = useState({});
+      const [pairingModeFor, setPairingModeFor] = useState(null);
+
+      // Undo State
+      const [undoStack, setUndoStack] = useState([]);
+
       const [dragSource, setDragSource] = useState(null);
       const [dragOverIdx, setDragOverIdx] = useState(null);
       const [dragOverPlayer, setDragOverPlayer] = useState(null);
       const [dragOverEmpty, setDragOverEmpty] = useState(null);
 
-      // Load session on startup
+      // Load session
       useEffect(() => {
         const session = load("session", null);
         if (session) {
@@ -124,18 +143,58 @@
           setStats(session.stats || {});
           setMatchHistory(session.matchHistory || []);
           setTab(session.tab || "play");
+          setUndoStack(session.undoStack || []);
+          setPairedWith(session.pairedWith || {});
         }
         setLoaded(true);
       }, []);
 
-      // Auto-save session when any critical state changes
+      // Auto-save
       useEffect(() => {
         if (!loaded) return;
         save("session", {
           phase, players, numCourts, courtModes, winStreakCap,
-          queue, courts, winStreaks, stats, matchHistory, tab
+          queue, courts, winStreaks, stats, matchHistory, tab, undoStack, pairedWith
         });
-      }, [loaded, phase, players, numCourts, courtModes, winStreakCap, queue, courts, winStreaks, stats, matchHistory, tab]);
+      }, [loaded, phase, players, numCourts, courtModes, winStreakCap, queue, courts, winStreaks, stats, matchHistory, tab, undoStack, pairedWith]);
+
+      // ─── Undo Logic ───
+      const pushUndo = () => {
+        setUndoStack(prev => [...prev, {
+          queue: JSON.parse(JSON.stringify(queue)),
+          courts: JSON.parse(JSON.stringify(courts)),
+          winStreaks: JSON.parse(JSON.stringify(winStreaks)),
+          stats: JSON.parse(JSON.stringify(stats)),
+          matchHistory: JSON.parse(JSON.stringify(matchHistory))
+        }]);
+      };
+
+      const undoLastRotation = () => {
+        if (undoStack.length === 0) return;
+        const last = undoStack[undoStack.length - 1];
+        setQueue(last.queue);
+        setCourts(last.courts);
+        setWinStreaks(last.winStreaks);
+        setStats(last.stats);
+        setMatchHistory(last.matchHistory);
+        setUndoStack(prev => prev.slice(0, -1));
+      };
+
+      // ─── Pairing Logic ───
+      const confirmPair = (targetName) => {
+        setPairedWith(prev => ({ ...prev, [pairingModeFor]: targetName, [targetName]: pairingModeFor }));
+        setPairingModeFor(null);
+      };
+
+      const unpair = (name) => {
+        const partner = pairedWith[name];
+        setPairedWith(prev => {
+          const next = { ...prev };
+          delete next[name];
+          if (partner) delete next[partner];
+          return next;
+        });
+      };
 
       // ─── Setup ───
       const addPlayer = () => {
@@ -146,7 +205,12 @@
         setPlayers(prev => [...prev, { name, lateJoin: false }]);
         setNameInput("");
       };
-      const removePlayer = (name) => setPlayers(prev => prev.filter(p => p.name !== name));
+      
+      const removePlayer = (name) => {
+        if (pairedWith[name]) unpair(name);
+        setPlayers(prev => prev.filter(p => p.name !== name));
+      };
+
       const handleCourtsChange = (n) => {
         setNumCourts(n);
         setCourtModes(prev => {
@@ -155,6 +219,7 @@
           return next.slice(0, n);
         });
       };
+      
       const toggleCourtMode = (i) => {
         setCourtModes(prev => {
           const next = [...prev];
@@ -162,6 +227,7 @@
           return next;
         });
       };
+      
       const minPlayers = courtModes.slice(0, numCourts).reduce((sum, m) => sum + (m === "doubles" ? 4 : 2), 0);
 
       const startSession = () => {
@@ -183,6 +249,8 @@
         setStats(initStats);
         setWinStreaks({});
         setMatchHistory([]);
+        setUndoStack([]);
+        setPairedWith({});
         setPhase("playing");
         setTab("play");
       };
@@ -193,25 +261,20 @@
         return ct.sideA.length === perSide && ct.sideB.length === perSide;
       };
 
-      // ─── Reset All ───
       const resetAll = () => {
         if (window.confirm("Are you sure you want to reset the entire session? This will clear all players, courts, and match history.")) {
-          setPhase("setup");
-          setPlayers([]);
-          setQueue([]);
-          setCourts([]);
-          setStats({});
-          setWinStreaks({});
-          setMatchHistory([]);
-          setTab("play");
-          setNameInput("");
-          setLateInput("");
+          setPhase("setup"); setPlayers([]); setQueue([]); setCourts([]);
+          setStats({}); setWinStreaks({}); setMatchHistory([]);
+          setTab("play"); setNameInput(""); setLateInput("");
+          setUndoStack([]); setPairedWith({}); setPairingModeFor(null);
         }
       };
 
       // ─── Side wins (rotation) ───
       const handleSideWin = (courtIndex, winningSide) => {
         if (!isCourtFull(courtIndex)) return;
+        pushUndo();
+
         const court = courts[courtIndex];
         const mode = courtModes[courtIndex];
         const perSide = mode === "doubles" ? 2 : 1;
@@ -251,6 +314,7 @@
 
         let newQueue = [...queue, ...losers.map(p => ({ ...p, paused: false })), ...rotatingWinners.map(p => ({ ...p, paused: false }))];
 
+        // Late unplayed priority
         const lateUnplayed = newQueue.filter(p => p.lateJoin && !p.paused && (newStats[p.name]?.gamesPlayed || 0) === 0);
         if (lateUnplayed.length > 0) {
           const allOriginalPlayed = Object.entries(newStats).every(([name, s]) => {
@@ -266,45 +330,105 @@
           }
         }
 
+        // Pull players from queue respecting Pairs
         const neededOnCourt = perSide * 2 - stayingWinners.length;
         const pulled = [];
-        const remaining = [];
-        for (const p of newQueue) {
-          if (pulled.length < neededOnCourt && !p.paused) {
+        const remainingQueue = [...newQueue];
+
+        while (pulled.length < neededOnCourt && remainingQueue.length > 0) {
+          let foundIdx = -1;
+          for (let i = 0; i < remainingQueue.length; i++) {
+            const p = remainingQueue[i];
+            if (p.paused) continue;
+
+            const partnerName = pairedWith[p.name];
+            if (partnerName) {
+              let nextAvailable = null;
+              for (let j = i + 1; j < remainingQueue.length; j++) {
+                if (!remainingQueue[j].paused) {
+                  nextAvailable = remainingQueue[j].name;
+                  break;
+                }
+              }
+              // Only pull the pair if they are adjacent available players AND we need at least 2 people
+              if (nextAvailable === partnerName && (neededOnCourt - pulled.length) >= 2) {
+                foundIdx = i;
+                break;
+              } else {
+                continue; // Skip them until they naturally fall next to each other
+              }
+            } else {
+              foundIdx = i;
+              break;
+            }
+          }
+
+          if (foundIdx !== -1) {
+            const p = remainingQueue[foundIdx];
             pulled.push(p);
+            remainingQueue.splice(foundIdx, 1);
+
+            // Pull partner simultaneously
+            if (pairedWith[p.name]) {
+              const partnerIdx = remainingQueue.findIndex(x => x.name === pairedWith[p.name]);
+              if (partnerIdx !== -1) {
+                pulled.push(remainingQueue[partnerIdx]);
+                remainingQueue.splice(partnerIdx, 1);
+              }
+            }
           } else {
-            remaining.push(p);
+            break;
           }
         }
 
-        const allForCourt = shuffle([...stayingWinners, ...pulled]);
+        // Assign to Sides keeping pairs together
+        let sideA = [];
+        let sideB = [];
+        let unassigned = [...stayingWinners, ...pulled];
+
+        const pairs = [];
+        const singles = [];
+        
+        while (unassigned.length > 0) {
+            const p = unassigned.shift();
+            if (pairedWith[p.name]) {
+                const partnerIdx = unassigned.findIndex(x => x.name === pairedWith[p.name]);
+                if (partnerIdx !== -1) {
+                    pairs.push([p, unassigned.splice(partnerIdx, 1)[0]]);
+                } else {
+                    singles.push(p);
+                }
+            } else {
+                singles.push(p);
+            }
+        }
+
+        pairs.forEach(pair => {
+            if (sideA.length + 2 <= perSide) sideA.push(...pair);
+            else if (sideB.length + 2 <= perSide) sideB.push(...pair);
+            else singles.push(...pair);
+        });
+
+        const shuffledSingles = shuffle(singles);
+        while (shuffledSingles.length > 0) {
+            if (sideA.length < perSide) sideA.push(shuffledSingles.pop());
+            else if (sideB.length < perSide) sideB.push(shuffledSingles.pop());
+        }
+
         const newCourts = [...courts];
-        newCourts[courtIndex] = { sideA: allForCourt.slice(0, perSide), sideB: allForCourt.slice(perSide, perSide * 2) };
+        newCourts[courtIndex] = { sideA, sideB };
 
         setStats(newStats);
         setWinStreaks(newStreaks);
         setMatchHistory(newHistory);
         setCourts(newCourts);
-        setQueue(remaining);
+        setQueue(remainingQueue);
       };
 
-      // ─── Queue drag reorder ───
-      const handleDragStart = (e, idx) => {
-        setDragSource({ type: "queue", idx });
-        e.dataTransfer.effectAllowed = "move";
-      };
-      const handleDragOverQueue = (e, idx) => {
-        e.preventDefault();
-        setDragOverIdx(idx);
-        setDragOverPlayer(null);
-        setDragOverEmpty(null);
-      };
-      const handleDragEnd = () => {
-        setDragSource(null);
-        setDragOverIdx(null);
-        setDragOverPlayer(null);
-        setDragOverEmpty(null);
-      };
+      // ─── Drag Handlers ───
+      const handleDragStart = (e, idx) => { setDragSource({ type: "queue", idx }); e.dataTransfer.effectAllowed = "move"; };
+      const handleDragOverQueue = (e, idx) => { e.preventDefault(); setDragOverIdx(idx); setDragOverPlayer(null); setDragOverEmpty(null); };
+      const handleDragEnd = () => { setDragSource(null); setDragOverIdx(null); setDragOverPlayer(null); setDragOverEmpty(null); };
       const handleDropQueue = (e, targetIdx) => {
         e.preventDefault();
         if (!dragSource || dragSource.type !== "queue") { handleDragEnd(); return; }
@@ -317,22 +441,12 @@
         handleDragEnd();
       };
 
-      // ─── Drag onto a specific player on court ───
-      const handlePlayerDragOver = (e, courtIndex, side, playerIndex) => {
-        e.preventDefault();
-        e.stopPropagation();
-        setDragOverPlayer({ courtIndex, side, playerIndex });
-        setDragOverIdx(null);
-        setDragOverEmpty(null);
-      };
-      const handlePlayerDragLeave = (e) => {
-        e.stopPropagation();
-        setDragOverPlayer(null);
-      };
+      const handlePlayerDragOver = (e, courtIndex, side, playerIndex) => { e.preventDefault(); e.stopPropagation(); setDragOverPlayer({ courtIndex, side, playerIndex }); setDragOverIdx(null); setDragOverEmpty(null); };
+      const handlePlayerDragLeave = (e) => { e.stopPropagation(); setDragOverPlayer(null); };
       const handlePlayerDrop = (e, courtIndex, side, playerIndex) => {
-        e.preventDefault();
-        e.stopPropagation();
+        e.preventDefault(); e.stopPropagation();
         if (!dragSource || dragSource.type !== "queue") { handleDragEnd(); return; }
+        pushUndo();
 
         const incoming = queue[dragSource.idx];
         const bumped = courts[courtIndex][side][playerIndex];
@@ -341,18 +455,10 @@
         const newCourts = courts.map((ct, i) => i === courtIndex ? { sideA: [...ct.sideA], sideB: [...ct.sideB] } : ct);
         newCourts[courtIndex][side] = newCourts[courtIndex][side].map((p, pi) => pi === playerIndex ? incoming : p);
 
-        setQueue(newQueue);
-        setCourts(newCourts);
-        handleDragEnd();
+        setQueue(newQueue); setCourts(newCourts); handleDragEnd();
       };
 
-      // ─── Drag onto empty side slot ───
-      const handleEmptyDragOver = (e, courtIndex, side) => {
-        e.preventDefault();
-        setDragOverEmpty({ courtIndex, side });
-        setDragOverIdx(null);
-        setDragOverPlayer(null);
-      };
+      const handleEmptyDragOver = (e, courtIndex, side) => { e.preventDefault(); setDragOverEmpty({ courtIndex, side }); setDragOverIdx(null); setDragOverPlayer(null); };
       const handleEmptyDragLeave = () => setDragOverEmpty(null);
       const handleEmptyDrop = (e, courtIndex, side) => {
         e.preventDefault();
@@ -360,15 +466,14 @@
         const mode = courtModes[courtIndex];
         const perSide = mode === "doubles" ? 2 : 1;
         if (courts[courtIndex][side].length >= perSide) { handleDragEnd(); return; }
+        pushUndo();
 
         const incoming = queue[dragSource.idx];
         const newQueue = queue.filter((_, i) => i !== dragSource.idx);
         const newCourts = courts.map((ct, i) => i === courtIndex ? { sideA: [...ct.sideA], sideB: [...ct.sideB] } : ct);
         newCourts[courtIndex][side] = [...newCourts[courtIndex][side], incoming];
 
-        setQueue(newQueue);
-        setCourts(newCourts);
-        handleDragEnd();
+        setQueue(newQueue); setCourts(newCourts); handleDragEnd();
       };
 
       const moveInQueue = (idx, dir) => {
@@ -377,7 +482,13 @@
         [nq[idx], nq[t]] = [nq[t], nq[idx]];
         setQueue(nq);
       };
-      const removeFromQueue = (idx) => setQueue(prev => prev.filter((_, i) => i !== idx));
+      
+      const removeFromQueue = (idx) => {
+        const p = queue[idx];
+        if (pairedWith[p.name]) unpair(p.name);
+        setQueue(prev => prev.filter((_, i) => i !== idx));
+      };
+      
       const togglePause = (idx) => {
         setQueue(prev => prev.map((p, i) => i === idx ? { ...p, paused: !p.paused } : p));
       };
@@ -477,7 +588,6 @@
         );
       };
 
-      // Ensure app doesn't flash empty state over local storage
       if (!loaded) return (
         <div style={{ background: c.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
           <div style={{ color: c.accent, fontFamily: "'DM Sans', sans-serif", fontSize: 18 }}>Loading...</div>
@@ -603,8 +713,9 @@
             <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
               <Badge color={c.accent}>{Object.keys(stats).length} players</Badge>
               <Badge color={c.warm}>{matchHistory.length} matches</Badge>
+              <Btn onClick={undoLastRotation} disabled={undoStack.length === 0} v="ghost" small>↩ Undo</Btn>
               <Btn onClick={endDay} v="warning" small>📋 End Day</Btn>
-              <Btn onClick={resetAll} v="danger" small>⚠️ Reset All</Btn>
+              <Btn onClick={resetAll} v="danger" small>⚠️ Reset</Btn>
             </div>
           </header>
 
@@ -739,14 +850,32 @@
                             color: p.paused ? c.textDim : c.text,
                             textDecoration: p.paused ? "line-through" : "none",
                           }}>{p.name}</span>
+                          
                           {p.paused && <Badge color={c.yellow}>Paused</Badge>}
                           {p.lateJoin && !p.paused && (stats[p.name]?.gamesPlayed || 0) === 0 && <Badge color={c.yellow}>Late</Badge>}
                           {!p.paused && (winStreaks[p.name] || 0) > 0 && <Badge color={c.warm}>🔥{winStreaks[p.name]}</Badge>}
-                          <div style={{ display: "flex", gap: 1 }}>
-                            <IconBtn onClick={() => moveInQueue(i, -1)} title="Up" color={c.textDim}>↑</IconBtn>
-                            <IconBtn onClick={() => moveInQueue(i, 1)} title="Down" color={c.textDim}>↓</IconBtn>
-                            <IconBtn onClick={() => togglePause(i)} title={p.paused ? "Unpause" : "Sit Out"} color={c.yellow}>{p.paused ? "▶" : "⏸"}</IconBtn>
-                            <IconBtn onClick={() => removeFromQueue(i)} title="Remove" color={c.red}>×</IconBtn>
+                          
+                          <div style={{ display: "flex", gap: 1, alignItems: "center" }}>
+                            {pairingModeFor === p.name ? (
+                                <Btn onClick={() => setPairingModeFor(null)} v="ghost" small style={{ padding: "4px 8px", fontSize: 10 }}>Cancel</Btn>
+                            ) : pairingModeFor ? (
+                                !pairedWith[p.name] && <Btn onClick={() => confirmPair(p.name)} v="primary" small style={{ padding: "4px 8px", fontSize: 10 }}>Select</Btn>
+                            ) : (
+                                <>
+                                  {pairedWith[p.name] ? (
+                                      <>
+                                          <Badge color={c.accentBright}>🔗 {pairedWith[p.name]}</Badge>
+                                          <IconBtn onClick={() => unpair(p.name)} title="Unpair" color={c.textDim}>✂️</IconBtn>
+                                      </>
+                                  ) : (
+                                      <IconBtn onClick={() => setPairingModeFor(p.name)} title="Pair With..." color={c.textDim}>🔗</IconBtn>
+                                  )}
+                                  <IconBtn onClick={() => moveInQueue(i, -1)} title="Up" color={c.textDim}>↑</IconBtn>
+                                  <IconBtn onClick={() => moveInQueue(i, 1)} title="Down" color={c.textDim}>↓</IconBtn>
+                                  <IconBtn onClick={() => togglePause(i)} title={p.paused ? "Unpause" : "Sit Out"} color={c.yellow}>{p.paused ? "▶" : "⏸"}</IconBtn>
+                                  <IconBtn onClick={() => removeFromQueue(i)} title="Remove" color={c.red}>×</IconBtn>
+                                </>
+                            )}
                           </div>
                         </div>
                       ))}
